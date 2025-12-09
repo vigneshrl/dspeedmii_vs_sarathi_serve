@@ -1,0 +1,224 @@
+# LLM Serving Benchmarks: DeepSpeed vs Sarathi-Serve
+
+This project benchmarks large language model (LLM) serving performance for two stacks:
+
+- DeepSpeed FastGen (via MII)
+- Sarathi-Serve
+
+We measure **throughput** (requests/sec) and **latency** (avg, p95) as a function of **batch size**, and provide a simple **HF demo** script for live or recorded demos.
+
+---
+
+## 1. Environment Setup
+
+### 1.1 Create Conda environment
+`conda create -n llm-bench python=3.10 -y`
+`conda activate llm-bench`
+
+
+### 1.2 Install PyTorch with CUDA
+
+Follow the command from https://pytorch.org matching your CUDA version. For example (CUDA 11.8):
+
+`conda install pytorch torchvision torchaudio pytorch-cuda=11.8 -c pytorch -c nvidia`
+
+Check: `python -c "import torch; print(torch.version, torch.cuda.is_available())"`
+
+---
+
+## 2. DeepSpeed / MII Setup
+
+### 2.1 Install DeepSpeed + MII + deps
+
+`pip install "deepspeed>=0.15.0" "deepspeed-mii>=0.3.3" transformers accelerate ninja`
+
+Quick sanity check: `python -c "import mii, torch; print('MII OK', torch.cuda.is_available())"`
+
+
+### 2.2 Known issue: kernel build + OOM
+
+On the lab cluster (RTX 4000, ~20 GiB):
+
+- DeepSpeed’s **v2 inference engine** tries to JIT-compile CUDA extensions (`inference_core_ops`) and allocate large **KV-cache** buffers.
+- For `mistralai/Mistral-7B-v0.1` this hit **CUDA out-of-memory** (OOM) during the flattening / KV-cache allocation step.
+- Even `facebook/opt-125m` sometimes triggered large KV-cache allocations (~18 GiB) when other jobs were already consuming 6–7 GiB on the GPU.
+
+Result: on the shared GPUs we could not reliably run Mistral‑7B with MII, and even OPT‑125m was limited by background memory usage.
+
+In the report, this is documented explicitly as a resource limitation.
+
+---
+
+## 3. Sarathi-Serve Setup
+
+Clone and install Sarathi-Serve in the same env or another one:
+
+`git clone https://github.com/microsoft/sarathi-serve.git`
+`cd sarathi-serve`
+
+### Example only – use the actual command from the repo
+python examples/serve.py
+--model facebook/opt-125m
+--port 8000
+--tp-size 1
+
+## Assumption in this project: Sarathi exposes an HTTP endpoint like:
+```
+POST /generate
+{
+"prompts": [...],
+"max_new_tokens": 32
+}
+```
+---
+
+## 4. Scripts Overview
+
+The project uses three main scripts:
+
+- `demo_hf.py` – simple HF baseline demo (single prompt).
+- `bench_deepspeed.py` – DeepSpeed/MII benchmark + CSV.
+- `bench_sarathi.py` – Sarathi-Serve benchmark + CSV.
+
+All three share the same metric definitions.
+
+### 4.1 demo_hf.py (baseline demo)
+
+`python3 demo_hf.py`
+
+
+What it does:
+
+1. Loads `MODEL_NAME` (e.g., `facebook/opt-125m`) with `AutoModelForCausalLM` and `AutoTokenizer`.
+2. Moves model to GPU (`cuda`) and uses `float16` when available.
+3. Takes a single natural-language prompt:
+   - e.g., “Explain the difference between DeepSpeed-FastGen and Sarathi-Serve in one sentence.”
+4. Calls `model.generate(max_new_tokens=64)` in `torch.no_grad()`.
+5. Decodes and prints the output plus the elapsed time.
+
+This is essentially **batch size = 1** of the same generation used in the benchmarks. It’s ideal for the live/recorded demo.
+
+---
+
+## 5. DeepSpeed Benchmark Script
+
+### 5.1 File: `bench_deepspeed.py`
+
+Usage:
+```
+conda activate llm-bench
+export CUDA_VISIBLE_DEVICES=0
+python bench_deepspeed.py
+```
+
+
+Configuration inside:
+
+- `MODEL_NAME = "facebook/opt-125m"` (can be changed to `mistralai/Mistral-7B-v0.1`, but likely OOM on shared GPUs).
+- `BATCH_SIZES = [1, 4, 8, 16]`
+- `NUM_ITERS = 20`
+- `MAX_NEW_TOKENS = 32`
+- `OUTPUT_CSV = "deepspeed_results.csv"`
+
+What it does:
+
+1. Calls `mii.pipeline(MODEL_NAME)` to build a DeepSpeed-MII pipeline.
+2. **Demo step**:
+   - Sends one prompt through the pipeline.
+   - Prints the generated text and latency.
+3. **Benchmark step**:
+   - For each `batch_size` in `BATCH_SIZES`:
+     - Builds `batch_size` identical prompts.
+     - Runs one **warm-up** call.
+     - Runs `NUM_ITERS` timed iterations:
+       - Time a `pipe(prompts, max_new_tokens=...)` call.
+       - Compute per-request latency = `batch_time / batch_size`.
+     - Aggregates metrics:
+       - Throughput = `(NUM_ITERS * batch_size) / total_wall_time`
+       - `avg_latency_ms` = mean of per-request latencies * 1000
+       - `p95_latency_ms` = 95th percentile of per-request latencies * 1000
+     - Writes a row to `deepspeed_results.csv` with:
+       - `system = "DeepSpeed-FastGen"`
+       - `model = MODEL_NAME`
+       - `batch_size`, `throughput_req_per_s`, `avg_latency_ms`, `p95_latency_ms`.
+
+**Important limitation:** on the cluster, this script frequently fails with CUDA OOM during KV-cache allocation for Mistral‑7B, and sometimes even for OPT‑125m if other jobs are using GPU memory. This is cited in the report as a key limitation.
+
+---
+
+## 6. Sarathi-Serve Benchmark Script
+
+### 6.1 File: `bench_sarathi.py`
+
+Prerequisite: Sarathi-Serve server is running and serving the same `MODEL_NAME` on `SARATHI_URL` (default in code: `http://localhost:8000/generate`).
+
+Usage:
+```
+conda activate llm-bench # or the Sarathi env
+export CUDA_VISIBLE_DEVICES=0
+python bench_sarathi.py
+```
+
+
+Configuration inside:
+
+- `MODEL_NAME = "facebook/opt-125m"` (must match the server).
+- `BATCH_SIZES = [1, 4, 8, 16]`
+- `NUM_ITERS = 20`
+- `MAX_NEW_TOKENS = 32`
+- `OUTPUT_CSV = "sarathi_results.csv"`
+- `SARATHI_URL = "http://localhost:8000/generate"` (edit if needed).
+
+What it does:
+
+1. Defines a helper `sarathi_generate(prompts)` that:
+   - Sends a POST request with `{"prompts": prompts, "max_new_tokens": MAX_NEW_TOKENS}`.
+   - Returns the JSON response.
+2. **Demo step**:
+   - Sends a single prompt to Sarathi.
+   - Prints the raw JSON response and elapsed time.
+3. **Benchmark step** (mirrors `bench_deepspeed.py`):
+   - For each `batch_size`:
+     - Builds `batch_size` prompts.
+     - Warm‑up: one untimed `sarathi_generate`.
+     - `NUM_ITERS` timed iterations:
+       - Call `sarathi_generate(prompts)` and measure batch time.
+       - Per‑request latency = `batch_time / batch_size`.
+     - Aggregates and writes to `sarathi_results.csv`:
+       - `system = "Sarathi-Serve"`
+       - `model = MODEL_NAME`
+       - `batch_size, throughput_req_per_s, avg_latency_ms, p95_latency_ms`.
+
+These CSVs have the same schema as `deepspeed_results.csv`, so they can be **plotted directly on the same graphs** (throughput vs batch size, latency vs batch size).
+
+---
+
+## 7. Interpreting and Reporting Issues
+
+In the technical report, we explicitly describe:
+
+- **What worked:**
+  - HF baseline (`demo_hf.py`) and HF benchmarks run reliably on the shared GPUs.
+  - Sarathi-Serve benchmarks run where the server is successfully deployed.
+
+- **What did not fully work:**
+  - DeepSpeed-MII + Mistral‑7B hit **CUDA OOM** during KV-cache setup, due to large allocations and limited free VRAM on 20 GiB GPUs with other jobs present.
+  - Even for OPT‑125m, DeepSpeed’s v2 engine sometimes attempted large KV-cache allocations (~18 GiB), failing when only ~11–12 GiB were free.
+
+We still use the same benchmark code structure and CSV schema for all systems, and clearly label any results that are synthetic/representative vs fully empirical.
+
+---
+
+## 8. Files Summary
+
+- `demo_hf.py`  
+  HF single-request demo to show end-to-end generation.
+
+- `bench_deepspeed.py`  
+  DeepSpeed-MII benchmark: warm-up + N iterations per batch size, outputs `deepspeed_results.csv`.
+
+- `bench_sarathi.py`  
+  Sarathi-Serve benchmark: same pattern, via HTTP client, outputs `sarathi_results.csv`.
+
+
+
